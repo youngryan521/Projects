@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FC Pack Automation v5
 // @namespace    https://github.com/youngryan521
-// @version      5.5
+// @version      5.6
 // @description  PackApp -> ShipApp auto-ship -- hazmat UN code support, adaptive box detection
 // @author       youngryan521
 // @match        https://packapp-sptc-prod-na.aka.corp.amazon.com/mix/index.html
@@ -20,44 +20,40 @@
 
   // --- CONFIG -----------------------------------------------------------------
   const STORAGE_KEY       = 'fc_pending_order_v5';
-  const POLL_MS           = 400;   // ShipApp storage poll interval
-  const BOX_DETECT_MAX_MS = 2000;  // max wait for box type to appear in PackApp DOM
-  const BOX_SEND_DELAY_MS = 600;   // wait after BOX/UN screen before sending next barcode
+  const POLL_MS           = 200;   // ShipApp storage poll interval (was 400ms)
+  const BOX_DETECT_MAX_MS = 2000;  // max wait for box type in PackApp DOM
+  const BOX_SEND_DELAY_MS = 600;   // settling pause after BOX/UN screen before sending
 
-  // Box type -> ShipApp barcode map
   const BOX_MAP = {
     PB2: 'FSA', PM4: 'FRQ', PM5: 'FRR', OWNBOX: 'OWNBOX', SIOC: 'OWNBOX',
   };
-
-  // Hazmat UN type -> ShipApp barcode map
-  // PackApp shows the UN number (e.g. "UN3481") as a header tile; ShipApp prompts
-  // "Scan the UN3481" and expects the corresponding barcode below.
   const HAZMAT_MAP = {
-    UN3481: 'UN3481BotBar',
-    UN3480: 'UN3480BotBar',
-    UN3091: 'UN3091BotBar',
-    UN3090: 'UN3090BotBar',
+    UN3481: 'UN3481BotBar', UN3480: 'UN3480BotBar',
+    UN3091: 'UN3091BotBar', UN3090: 'UN3090BotBar',
   };
 
-  // Pre-compiled regexes -- created once at startup, reused on every detect call
-  const BOX_REGEX = Object.fromEntries(
-    Object.keys(BOX_MAP).map(k => [k, new RegExp(`\\b${k}\\b`)])
-  );
-  const HAZMAT_REGEX = Object.fromEntries(
-    Object.keys(HAZMAT_MAP).map(k => [k, new RegExp(`\\b${k}\\b`, 'i')])
-  );
+  // Pre-cached key arrays -- avoids Object.keys() allocation on every detect call
+  const BOX_KEYS    = Object.keys(BOX_MAP);
+  const HAZMAT_KEYS = Object.keys(HAZMAT_MAP);
 
-  // --- Shared utilities (used by both PackApp and ShipApp) --------------------
+  // 'i' flag on BOX_REGEX lets detectBox() use textContent without .toUpperCase()
+  // (textContent skips layout reflow that innerText forces)
+  const BOX_REGEX    = Object.fromEntries(BOX_KEYS.map(k    => [k, new RegExp(`\\b${k}\\b`, 'i')]));
+  const HAZMAT_REGEX = Object.fromEntries(HAZMAT_KEYS.map(k => [k, new RegExp(`\\b${k}\\b`, 'i')]));
 
-  // Polls predFn every intervalMs until it returns truthy or timeoutMs elapses.
-  function waitFor(predFn, timeoutMs, intervalMs = 100) {
+  // --- Shared utilities -------------------------------------------------------
+
+  // MutationObserver-based wait -- resolves the moment predFn() returns truthy,
+  // or false after timeoutMs. Fires on DOM changes instead of polling every 100ms,
+  // saving up to 100ms per screen transition vs the old setInterval approach.
+  function waitFor(predFn, timeoutMs) {
     return new Promise(resolve => {
       if (predFn()) return resolve(true);
-      const start = Date.now();
-      const id = setInterval(() => {
-        if (predFn()) { clearInterval(id); resolve(true); }
-        else if (Date.now() - start >= timeoutMs) { clearInterval(id); resolve(false); }
-      }, intervalMs);
+      const ob = new MutationObserver(() => {
+        if (predFn()) { ob.disconnect(); clearTimeout(tid); resolve(true); }
+      });
+      ob.observe(document.body, { childList: true, subtree: true, characterData: true });
+      const tid = setTimeout(() => { ob.disconnect(); resolve(false); }, timeoutMs);
     });
   }
 
@@ -72,10 +68,10 @@
   function runPackApp() {
     let buffer      = '';
     let toteScanned = false;
-    let pslipCode   = null; // set when PSLIP barcode is scanned; cleared after SP00
-    let hazmatCode  = null; // set when UN hazmat type is detected on page; cleared after SP00
+    let pslipCode   = null;
+    let hazmatCode  = null;
 
-    // -- Status banner ---------------------------------------------------------
+    // -- Status banner ----------------------------------------------------------
     const banner = document.createElement('div');
     Object.assign(banner.style, {
       position: 'fixed', top: '0', left: '0', right: '0',
@@ -93,18 +89,11 @@
       banner._t = setTimeout(() => { banner.style.display = 'none'; }, ms);
     }
 
-    // -- PSLIP + Hazmat state watcher ------------------------------------------
-    // Runs every 600ms. Tracks PSLIP prompt state and captures hazmat UN type.
-    //
-    // Hazmat orders show "Scan UN3481 label" (orange prompt) when an item needs a
-    // hazmat label affixed. The UN type (e.g. UN3481) stays visible as a header tile
-    // throughout the rest of the packing sequence. This watcher captures it so it's
-    // ready when SP00 is scanned.
+    // -- PSLIP + hazmat state watcher -------------------------------------------
     let pslipVisible = false;
     setInterval(() => {
       const text = document.body.innerText;
 
-      // PSLIP check (unchanged from v5.3)
       const nowPslipVisible = /scan\s+pslip/i.test(text);
       if (nowPslipVisible && !pslipVisible) {
         pslipVisible = true;
@@ -117,8 +106,6 @@
         if (!pslipCode) banner.style.display = 'none';
       }
 
-      // Hazmat check: detect UN type from page text (prompt screen OR persistent header tile).
-      // Only sets hazmatCode -- never clears it here (cleared on tote scan or after SP00).
       if (!hazmatCode) {
         const h = detectHazmat();
         if (h) {
@@ -128,7 +115,7 @@
       }
     }, 600);
 
-    // -- Scanner buffer --------------------------------------------------------
+    // -- Scanner buffer ---------------------------------------------------------
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         const raw = buffer.trim();
@@ -140,29 +127,25 @@
     }, true);
 
     function onScan(input) {
-      // -- Tote: first scan that is neither SP00 nor PSLIP --
-      // Reset hazmatCode here so a non-hazmat tote doesn't carry over a stale code.
       if (!toteScanned && !/^sp/.test(input) && !/^S[A-Za-z0-9]/.test(input)) {
         toteScanned = true;
-        hazmatCode  = null; // fresh tote -- clear any leftover hazmat state
+        hazmatCode  = null;
         return;
       }
 
-      // -- PSLIP barcode: uppercase S prefix, length >= 8, prompt visible --
       if (/^S[A-Za-z0-9]/.test(input) && input.length >= 8 && pslipVisible) {
         pslipCode = input;
         showBanner('✓ PSLIP scanned -- now scan SP00', '#7b4400', 4000);
         return;
       }
 
-      // -- SP00 --
       if (/^sp/.test(input) && input.length >= 8) {
         if (pslipVisible && !pslipCode) {
           showBanner('⚠ Scan PSLIP first -- then scan SP00 again', '#7b4400', 5000);
           return;
         }
 
-        // Adaptive box detection: poll every 100ms until box type appears in DOM.
+        // MutationObserver-backed waitFor: resolves the moment box type appears in DOM
         waitFor(() => !!detectBox(), BOX_DETECT_MAX_MS).then(found => {
           const box     = found && detectBox();
           const barcode = box && BOX_MAP[box];
@@ -171,21 +154,16 @@
             return;
           }
 
-          // Hazmat: use cached hazmatCode (set by watcher) or detect live as fallback.
-          // detectHazmat() as fallback handles the case where the watcher hasn't fired yet.
           const hazmat        = hazmatCode || detectHazmat();
           const hazmatBarcode = hazmat ? HAZMAT_MAP[hazmat] : null;
 
           GM_setValue(STORAGE_KEY, JSON.stringify({
             sp00: input, box, barcode,
-            hazmat: hazmat || null,
-            hazmatBarcode: hazmatBarcode || null,
+            hazmat: hazmat || null, hazmatBarcode: hazmatBarcode || null,
             ts: Date.now(),
           }));
 
-          const hazmatSuffix = hazmat ? `  HAZMAT: ${hazmat}` : '';
-          showBanner(`✓ Sent to ShipApp -- ${input}  [${box} -> ${barcode}]${hazmatSuffix}`);
-
+          showBanner(`✓ Sent to ShipApp -- ${input}  [${box} -> ${barcode}]${hazmat ? `  HAZMAT: ${hazmat}` : ''}`);
           toteScanned = false;
           pslipCode   = null;
           hazmatCode  = null;
@@ -193,19 +171,18 @@
       }
     }
 
-    // Uses pre-compiled BOX_REGEX -- no RegExp construction on each call
+    // textContent skips layout reflow; BOX_REGEX is case-insensitive so no .toUpperCase() needed
     function detectBox() {
-      const text = document.body.innerText.toUpperCase();
-      for (const key of Object.keys(BOX_MAP)) {
+      const text = document.body.textContent;
+      for (const key of BOX_KEYS) {
         if (BOX_REGEX[key].test(text)) return key;
       }
       return null;
     }
 
-    // Uses pre-compiled HAZMAT_REGEX -- case-insensitive, word-boundary match
     function detectHazmat() {
-      const text = document.body.innerText;
-      for (const key of Object.keys(HAZMAT_MAP)) {
+      const text = document.body.textContent;
+      for (const key of HAZMAT_KEYS) {
         if (HAZMAT_REGEX[key].test(text)) return key;
       }
       return null;
@@ -218,7 +195,7 @@
   function runShipApp() {
     let busy = false;
 
-    // -- Status overlay --------------------------------------------------------
+    // -- Status overlay ---------------------------------------------------------
     const overlay = document.createElement('div');
     Object.assign(overlay.style, {
       position: 'fixed', bottom: '8px', right: '8px',
@@ -236,7 +213,6 @@
     const debug  = m => { dLine.textContent = m; };
     status('⏳ FC Auto v5: waiting for order…');
 
-    // -- Poll + immediate visibility trigger -----------------------------------
     setInterval(poll, POLL_MS);
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden && !busy) poll();
@@ -244,17 +220,13 @@
 
     async function poll() {
       if (busy) return;
-
       const raw = GM_getValue(STORAGE_KEY, '');
       if (!raw) return;
-
       let order;
       try { order = JSON.parse(raw); }
       catch (_) { GM_setValue(STORAGE_KEY, ''); return; }
-
       if (Date.now() - order.ts > 5 * 60 * 1000) { GM_setValue(STORAGE_KEY, ''); return; }
       if (!document.body.innerText.includes('Scan the SP')) return;
-
       busy = true;
       GM_setValue(STORAGE_KEY, '');
       await processOrder(order);
@@ -262,12 +234,12 @@
     }
 
     async function processOrder(order) {
-      // -- Step 1: send SP00 ----------------------------------------------------
+      // Step 1: send SP00
       status(`▶ Sending SP00: ${order.sp00}…`);
       debug('');
       sendBarcode(order.sp00);
 
-      // -- Step 2: wait for BOX screen ------------------------------------------
+      // Step 2: wait for BOX screen -- MutationObserver fires the moment DOM updates
       const boxReady = await waitFor(() => {
         const t = document.body.innerText;
         return t.includes('Scan the BOX') || t.includes('scan the box') ||
@@ -286,15 +258,13 @@
         return;
       }
 
-      // -- Step 3: send box barcode ---------------------------------------------
+      // Step 3: send box barcode
       await sleep(BOX_SEND_DELAY_MS);
       status(`▶ Sending box: ${order.barcode}…`);
       debug(`Box: ${order.box} -> ${order.barcode}`);
       sendBarcode(order.barcode);
 
-      // -- Step 4: wait for hazmat UN prompt, SUCCESS, or FAILURE ---------------
-      // Hazmat orders show "Scan the UN3481" (or other UN code) after the box scan.
-      // Non-hazmat orders go straight to SUCCESS.
+      // Step 4: wait for hazmat UN prompt, SUCCESS, or FAILURE
       const afterBox = await waitFor(() => {
         const t = document.body.innerText;
         return t.includes('SUCCESS') || t.includes('success') ||
@@ -308,10 +278,8 @@
         return;
       }
 
-      // -- Step 5 (hazmat orders only): send hazmat barcode ---------------------
+      // Step 5 (hazmat only): send hazmat barcode
       if (/Scan the UN\d{4}/i.test(document.body.innerText)) {
-        // Primary: use hazmatBarcode from the order payload (set by PackApp side).
-        // Fallback: read the UN type directly from the ShipApp page and look it up.
         const hazmatBarcode = order.hazmatBarcode || (() => {
           const m = document.body.innerText.match(/Scan the (UN\d{4})/i);
           return m && HAZMAT_MAP[m[1].toUpperCase()];
@@ -328,7 +296,7 @@
         debug(`Hazmat: ${order.hazmat || 'detected'} -> ${hazmatBarcode}`);
         sendBarcode(hazmatBarcode);
 
-        // -- Step 6: wait for final result after hazmat scan --------------------
+        // Step 6: wait for final result
         const finalDone = await waitFor(() => {
           const t = document.body.innerText;
           return t.includes('SUCCESS') || t.includes('success') ||
@@ -351,7 +319,7 @@
         }
 
       } else {
-        // -- Normal (non-hazmat) result ------------------------------------------
+        // Normal (non-hazmat) result
         const pageText = document.body.innerText;
         if (pageText.includes('SUCCESS') || pageText.includes('success')) {
           status(`✅ Shipped! ${order.sp00}  [${order.box} -> ${order.barcode}]`);
@@ -362,19 +330,33 @@
         }
       }
 
-      await sleep(2000);
+      await sleep(500);   // was 2000ms -- briefly show result before resetting
       status('⏳ FC Auto v5: waiting for order…');
       debug('');
     }
 
-    // -- Barcode input ---------------------------------------------------------
+    // -- Barcode input ----------------------------------------------------------
+
+    // Angular path cached after first call: ShipApp's Angular controllers don't
+    // expose known barcode methods in practice, so tryAngular() always returns false.
+    // Caching skips the querySelectorAll DOM scan on every subsequent sendBarcode() call.
+    let angularChecked = false;
+    let angularWorks   = false;
+
     function sendBarcode(barcode) {
+      if (angularChecked && !angularWorks) {
+        // Angular confirmed unavailable -- go straight to keyboard events
+        for (const char of barcode) fireChar(char);
+        fireEnter();
+        return;
+      }
       if (tryAngular(barcode)) return;
       for (const char of barcode) fireChar(char);
       fireEnter();
     }
 
     function tryAngular(barcode) {
+      angularChecked = true;
       try {
         const ng = (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window).angular;
         if (!ng) return false;
@@ -384,12 +366,14 @@
           if (typeof scope.publishBuffer === 'function') {
             scope.$apply(() => { scope.keystrokeBuffer = barcode; scope.publishBuffer(); });
             debug(`Angular: publishBuffer("${barcode}")`);
+            angularWorks = true;
             return true;
           }
           for (const m of ['submitBarcode', 'handleBarcode', 'processInput', 'submit']) {
             if (typeof scope[m] === 'function') {
               scope.$apply(() => scope[m](barcode));
               debug(`Angular: ${m}("${barcode}")`);
+              angularWorks = true;
               return true;
             }
           }
