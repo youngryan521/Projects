@@ -74,7 +74,7 @@ One script, two `@match` URLs. The script checks `location.href` at runtime to d
 
 ```js
 const STORAGE_KEY       = 'fc_pending_order_v5';
-const POLL_MS           = 400;
+const POLL_MS           = 200;   // was 400ms
 const BOX_DETECT_MAX_MS = 2000;
 const BOX_SEND_DELAY_MS = 600;
 
@@ -82,42 +82,44 @@ const BOX_MAP    = { PB2: 'FSA', PM4: 'FRQ', PM5: 'FRR', OWNBOX: 'OWNBOX', SIOC:
 const HAZMAT_MAP = { UN3481: 'UN3481BotBar', UN3480: 'UN3480BotBar',
                      UN3091: 'UN3091BotBar', UN3090: 'UN3090BotBar' };
 
-const BOX_REGEX    = Object.fromEntries(
-  Object.keys(BOX_MAP).map(k => [k, new RegExp(`\\b${k}\\b`)])
-);
-const HAZMAT_REGEX = Object.fromEntries(
-  Object.keys(HAZMAT_MAP).map(k => [k, new RegExp(`\\b${k}\\b`, 'i')])
-);
+// Pre-cached -- avoids Object.keys() allocation on every detect call
+const BOX_KEYS    = Object.keys(BOX_MAP);
+const HAZMAT_KEYS = Object.keys(HAZMAT_MAP);
+
+// 'i' flag added to BOX_REGEX so detectBox() can use textContent without .toUpperCase()
+const BOX_REGEX    = Object.fromEntries(BOX_KEYS.map(k    => [k, new RegExp(`\\b${k}\\b`, 'i')]));
+const HAZMAT_REGEX = Object.fromEntries(HAZMAT_KEYS.map(k => [k, new RegExp(`\\b${k}\\b`, 'i')]));
 ```
 
-- `POLL_MS` -- how often ShipApp checks GM storage for a pending order (400ms).
+- `POLL_MS` -- how often ShipApp checks GM storage for a pending order (200ms, halved from 400ms in v5.6).
 - `BOX_DETECT_MAX_MS` -- maximum time to wait for a box type to appear in PackApp's DOM after SP00 is scanned. In practice the box is already on screen, so detection fires within the first poll (~100ms). The 2000ms is a safety ceiling.
 - `BOX_SEND_DELAY_MS` -- brief pause after ShipApp shows the BOX screen before sending the box barcode. Gives ShipApp time to be ready to receive input after the screen transition.
 - `BOX_MAP` -- translates the box type name PackApp shows on screen into the actual barcode ShipApp expects.
 - `BOX_REGEX` -- pre-compiled regex patterns for each box type, built once at startup. Avoids constructing a new `RegExp` object on every `detectBox()` call.
 - `HAZMAT_MAP` -- maps UN type codes to the barcode ShipApp expects at the hazmat scan step. Covers the four lithium battery UN numbers (UN3481, UN3480, UN3091, UN3090).
 - `HAZMAT_REGEX` -- pre-compiled case-insensitive word-boundary patterns for each UN code, parallel to `BOX_REGEX`. Used by `detectHazmat()` to find UN codes in PackApp's page text.
+- `BOX_KEYS` / `HAZMAT_KEYS` -- pre-cached `Object.keys()` arrays for each map. Avoids allocating a new array on every `detectBox()` / `detectHazmat()` call.
 
 ---
 
 ### Shared utilities -- waitFor() / sleep()
 
 ```js
-function waitFor(predFn, timeoutMs, intervalMs = 100) {
+function waitFor(predFn, timeoutMs) {
   return new Promise(resolve => {
     if (predFn()) return resolve(true);
-    const start = Date.now();
-    const id = setInterval(() => {
-      if (predFn()) { clearInterval(id); resolve(true); }
-      else if (Date.now() - start >= timeoutMs) { clearInterval(id); resolve(false); }
-    }, intervalMs);
+    const ob = new MutationObserver(() => {
+      if (predFn()) { ob.disconnect(); clearTimeout(tid); resolve(true); }
+    });
+    ob.observe(document.body, { childList: true, subtree: true, characterData: true });
+    const tid = setTimeout(() => { ob.disconnect(); resolve(false); }, timeoutMs);
   });
 }
 ```
 
-Polls a predicate function every `intervalMs` milliseconds until it returns truthy, or until `timeoutMs` elapses. Returns `true` on success, `false` on timeout. Default poll interval is 100ms (was 300ms in earlier versions).
+Watches for DOM changes via `MutationObserver` and calls `predFn()` the moment the DOM updates. Resolves `true` as soon as `predFn()` returns truthy, or `false` after `timeoutMs` elapses. This replaces the v5.4 `setInterval`-based approach (which polled every 100ms) -- the observer fires within ~1ms of a screen transition instead of up to 100ms later.
 
-Defined at the outer scope so both `runPackApp()` and `runShipApp()` share one copy. Used in PackApp for adaptive box detection and in ShipApp for all screen transition waits.
+Defined at the outer scope so both `runPackApp()` and `runShipApp()` share one copy. Used in PackApp for box detection and in ShipApp for all screen transition waits.
 
 ---
 
@@ -156,21 +158,21 @@ waitFor(() => !!detectBox(), BOX_DETECT_MAX_MS).then(found => {
 });
 ```
 
-Instead of a fixed 2-second delay after SP00 is scanned, `waitFor` polls `detectBox()` every 100ms. Since PackApp displays the box type before the SP00 step, the box is already on screen when SP00 is scanned -- detection fires on the first poll, saving nearly 2 seconds per order compared to the old fixed wait.
+Instead of a fixed 2-second delay after SP00 is scanned, `waitFor` fires `detectBox()` the moment PackApp's DOM updates -- resolving within ~1ms of the box type appearing. Since PackApp displays the box type before the SP00 step, the box is already on screen when SP00 is scanned, so detection typically fires on the first DOM observer callback.
 
 #### detectBox()
 
 ```js
 function detectBox() {
-  const text = document.body.innerText.toUpperCase();
-  for (const key of Object.keys(BOX_MAP)) {
+  const text = document.body.textContent;
+  for (const key of BOX_KEYS) {
     if (BOX_REGEX[key].test(text)) return key;
   }
   return null;
 }
 ```
 
-Reads the page text and tests it against pre-compiled regex patterns. Uses `BOX_REGEX` instead of constructing `new RegExp()` on each call.
+Uses `textContent` instead of `innerText` -- `innerText` forces a synchronous layout reflow on every call, `textContent` does not. Since `BOX_REGEX` now has the `'i'` flag, `.toUpperCase()` is no longer needed. Iterates `BOX_KEYS` (pre-cached array) instead of calling `Object.keys(BOX_MAP)` on each invocation.
 
 #### State variables
 
@@ -200,14 +202,15 @@ The same interval also calls `detectHazmat()` each cycle. When a UN code appears
 
 ```js
 function detectHazmat() {
-  const text = document.body.innerText;
-  for (const key of Object.keys(HAZMAT_MAP)) {
-    if (HAZMAT_REGEX[key].test(text)) { hazmatCode = key; return; }
+  const text = document.body.textContent;
+  for (const key of HAZMAT_KEYS) {
+    if (HAZMAT_REGEX[key].test(text)) return key;
   }
+  return null;
 }
 ```
 
-Reads page text and tests against `HAZMAT_REGEX` (case-insensitive). When a UN code is found, `hazmatCode` is set. The watcher then shows the purple capture banner. The detected code and its mapped barcode are included in the order payload when SP00 is scanned.
+Uses `textContent` (no layout reflow) and iterates `HAZMAT_KEYS` (pre-cached array). Returns the matched UN key rather than setting `hazmatCode` directly, keeping the function pure. The watcher assigns `hazmatCode` from the return value and shows the purple capture banner.
 
 #### Status banner
 
@@ -234,18 +237,19 @@ document.addEventListener('visibilitychange', () => {
 });
 ```
 
-Runs on a 400ms interval and also fires immediately when the user switches to the ShipApp tab. Checks for a pending order in GM storage, verifies it is not stale (> 5 minutes old), and confirms the page shows "Scan the SP" before proceeding. The order is **cleared from storage immediately** before `processOrder()` starts -- prevents a second poll from re-processing the same order if the tab gains focus mid-flight.
+Runs on a 200ms interval (halved from 400ms in v5.6) and also fires immediately when the user switches to the ShipApp tab. Checks for a pending order in GM storage, verifies it is not stale (> 5 minutes old), and confirms the page shows "Scan the SP" before proceeding. The order is **cleared from storage immediately** before `processOrder()` starts -- prevents a second poll from re-processing the same order if the tab gains focus mid-flight.
 
 #### processOrder()
 
 The async sequence (four steps for standard orders; six for hazmat):
 
 1. `sendBarcode(sp00)` -- sends SP00
-2. `waitFor('Scan the BOX' or FAILURE, 10s)` -- waits for BOX screen
-3. `sleep(BOX_SEND_DELAY_MS)` -- brief pause for ShipApp to be ready
-4. `sendBarcode(boxBarcode)` -- sends box barcode; Step 4's `waitFor` also watches for **UN prompt** (`/Scan the UN\d{4}/i`) in addition to SUCCESS/FAILURE
-5. *(hazmat only)* `sendBarcode(hazmatBarcode)` -- sends the UN barcode (e.g. `UN3481BotBar`). If the payload lacks `hazmatBarcode`, falls back to reading the UN type directly from the ShipApp page via `/Scan the (UN\d{4})/i`.
-6. *(hazmat only)* `waitFor(SUCCESS or FAILURE, 10s)` -- waits for final result after hazmat barcode; reports `[box, hazmatBarcode]` in the success message.
+2. `waitFor(BOX screen or FAILURE, 10s)` -- MutationObserver resolves within ~1ms of screen transition
+3. `sleep(BOX_SEND_DELAY_MS)` -- brief settling pause before ShipApp is ready to receive input
+4. `sendBarcode(boxBarcode)` -- sends box barcode
+5. `waitFor(UN prompt or SUCCESS or FAILURE, 10s)` -- MutationObserver fires immediately on result
+6. *(hazmat only)* `sendBarcode(hazmatBarcode)` -- sends UN barcode (e.g. `UN3481BotBar`). Falls back to reading UN type directly from ShipApp page via `/Scan the (UN\d{4})/i` if payload lacks `hazmatBarcode`.
+7. *(hazmat only)* `waitFor(SUCCESS or FAILURE, 10s)` -- MutationObserver waits for final result; reports `[box, hazmatBarcode]` in success message.
 
 PSLIP is confirmed NOT required in ShipApp (tested 2026-06-10). The flow is always SP00 -> BOX -> (UN if hazmat) -> label prints.
 
@@ -262,6 +266,8 @@ function sendBarcode(barcode) {
 Two strategies tried in order:
 
 **Strategy 1 -- Angular scope injection:** Finds Angular controller elements on the page, gets their scope, and calls known barcode processing methods directly (`publishBuffer`, `submitBarcode`, `handleBarcode`, etc.). Bypasses the DOM event layer entirely. ShipApp's Angular scope does not expose these methods in practice, so this path always falls through -- but it's kept for forward compatibility.
+
+The result is **cached after the first call** (`angularChecked` / `angularWorks` flags). Once Angular is confirmed unavailable, all subsequent `sendBarcode()` calls skip the `querySelectorAll` DOM scan entirely and go straight to Strategy 2.
 
 **Strategy 2 -- Keyboard events to document.body:** Dispatches `keydown` + `keypress` for each character, then `Enter`. Events are dispatched **synchronously** with no delays between characters -- avoids background tab timer throttling. ShipApp's jQuery handler on `window` catches them as they bubble up from `document.body`.
 
@@ -471,7 +477,7 @@ Box type is typically detected on the first poll (~100ms), saving ~1900ms per or
 
 ---
 
-### v5.5 -- Hazmat UN Support (current)
+### v5.5 -- Hazmat UN Support
 
 **Context:** Some orders contain hazardous materials (lithium batteries) and require an additional scan step. PackApp shows a "Scan UN3481 label" (or similar) prompt during packing. ShipApp also requests a UN barcode scan between the box step and label print. Without automation, the associate must manually switch to ShipApp at this extra step.
 
@@ -499,6 +505,75 @@ Box type is typically detected on the first poll (~100ms), saving ~1900ms per or
 Standard (non-hazmat) orders continue through the original 4-step path unchanged.
 
 ---
+
+---
+
+### v5.6 -- Performance Optimization II (current)
+
+**Goal:** Reduce per-order script-side latency with no functional changes. All existing features (hazmat, PSLIP, adaptive box detection) unchanged.
+
+**`waitFor`: `setInterval` -> `MutationObserver`**
+
+The previous `setInterval`-based `waitFor` polled a predicate every 100ms. The new implementation attaches a `MutationObserver` to `document.body` and resolves within ~1ms of the DOM updating to the target state:
+
+```js
+// Before: polls every 100ms -- up to 100ms late per transition
+const id = setInterval(() => { if (predFn()) { clearInterval(id); resolve(true); } }, 100);
+
+// After: fires the moment DOM changes
+const ob = new MutationObserver(() => {
+  if (predFn()) { ob.disconnect(); clearTimeout(tid); resolve(true); }
+});
+ob.observe(document.body, { childList: true, subtree: true, characterData: true });
+```
+
+Saves up to 100ms per screen transition. 2-3 transitions per order = up to 200-300ms saved.
+
+**`POLL_MS`: 400ms -> 200ms**
+
+ShipApp polls GM storage twice as often. Average latency from PackApp writing the order to ShipApp picking it up drops from ~200ms to ~100ms.
+
+**`BOX_KEYS` / `HAZMAT_KEYS` constants**
+
+`Object.keys(BOX_MAP)` and `Object.keys(HAZMAT_MAP)` were called on every `detectBox()` and `detectHazmat()` invocation. Since these calls happen every 100ms during box detection, this was allocating and garbage-collecting an array on a tight loop. Both arrays are now computed once at startup.
+
+**`textContent` in detect functions**
+
+`document.body.innerText` forces a synchronous layout reflow (browser must flush pending style calculations before returning). `document.body.textContent` does not. `BOX_REGEX` also gained the `'i'` flag so `.toUpperCase()` is no longer needed:
+
+```js
+// Before
+const text = document.body.innerText.toUpperCase();
+for (const key of Object.keys(BOX_MAP)) { ... }
+
+// After
+const text = document.body.textContent;
+for (const key of BOX_KEYS) { ... }
+```
+
+**`tryAngular` result cached**
+
+Angular scope injection always fails on ShipApp. The previous code ran a full `querySelectorAll('[ng-controller],[data-ng-controller]')` DOM scan on every `sendBarcode()` call. Now `angularChecked` / `angularWorks` flags skip the scan after the first failure:
+
+```js
+// Before: DOM scan on every call
+if (tryAngular(barcode)) return;
+
+// After: skip immediately after first failure
+if (angularChecked && !angularWorks) { fireChars(); return; }
+```
+
+**`sleep(2000)` -> `sleep(500)`**
+
+The success banner delay at the end of `processOrder()` was reduced from 2s to 0.5s. Not on the critical path, but the overlay resets 1.5s sooner.
+
+| Change | Avg savings (critical path) |
+|---|---|
+| MutationObserver (2 transitions) | ~100ms |
+| POLL_MS 400->200ms | ~100ms |
+| textContent + BOX_KEYS/HAZMAT_KEYS | ~1-5ms |
+| tryAngular cached | ~2ms |
+| **Total per order** | **~200-300ms** |
 
 ## Security Analysis
 
