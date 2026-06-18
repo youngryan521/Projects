@@ -508,7 +508,7 @@ Standard (non-hazmat) orders continue through the original 4-step path unchanged
 
 ---
 
-### v5.6 -- Performance Optimization II (current)
+### v5.6 -- Performance Optimization II
 
 **Goal:** Reduce per-order script-side latency with no functional changes. All existing features (hazmat, PSLIP, adaptive box detection) unchanged.
 
@@ -574,6 +574,34 @@ The success banner delay at the end of `processOrder()` was reduced from 2s to 0
 | textContent + BOX_KEYS/HAZMAT_KEYS | ~1-5ms |
 | tryAngular cached | ~2ms |
 | **Total per order** | **~200-300ms** |
+
+---
+
+### v5.7 -- Hazmat Banner Persistence Fix (current)
+
+**Bug:** The purple "Hazmat captured" banner reappeared on the next watcher cycle after an order was sent, and continued looping until the next tote scan.
+
+**Root cause:** After SP00 is scanned, `hazmatCode` was cleared to `null`. The 600ms DOM watcher then fired, found `hazmatCode === null`, called `detectHazmat()`, and found the UN code **still visible in PackApp's DOM** (the page hadn't transitioned to the next order yet). It re-set `hazmatCode` and re-showed the purple banner. This repeated every 600ms until the next tote was scanned.
+
+**Fix:** Removed `hazmatCode = null` from the SP00 handler. The watcher's existing `if (!hazmatCode)` guard already prevents re-detection when the code is set. `hazmatCode` is now only cleared in one place -- the tote scan handler -- which is the correct reset point between orders:
+
+```js
+// Before (broken): cleared after SP00 -- watcher re-detects on next cycle
+hazmatCode = null;   // <-- removed
+
+// After (fixed): hazmatCode persists until next tote scan
+// Watcher guard: if (!hazmatCode) { ... } -- skips detection while code is set
+// Tote scan: hazmatCode = null  <-- only reset point
+```
+
+**Order flow with fix:**
+1. Tote scan -- `hazmatCode = null` (reset here)
+2. Hazmat items packed -- UN prompt visible in DOM
+3. Watcher detects UN code -- `hazmatCode = "UN3481"`, purple banner shown
+4. SP00 scanned -- green confirmation banner replaces purple, `hazmatCode` stays set
+5. Watcher fires -- `if (!hazmatCode)` is false, skips detection, no re-banner
+6. Green banner auto-hides after 4s
+7. Next tote scan -- `hazmatCode = null` (reset for next order)
 
 ## Security Analysis
 
@@ -732,7 +760,11 @@ The report lists 33 techniques, all with **0 malicious** and **0 suspicious** hi
 
 1. Install **Tampermonkey** from the Firefox Add-ons store (no admin required)
 2. Open this link in Firefox:
-   `https://raw.githubusercontent.com/youngryan521/Projects/main/fc-auto-v5.user.js`
+
+```
+https://raw.githubusercontent.com/youngryan521/Projects/main/fc-auto-v5.user.js
+```
+
 3. Tampermonkey will intercept the `.user.js` link and show an install prompt -- click **Install**
 4. Confirm both PackApp and ShipApp URLs appear in the script's match list
 
@@ -740,7 +772,11 @@ The report lists 33 techniques, all with **0 malicious** and **0 suspicious** hi
 
 1. Install **Tampermonkey** from the Firefox Add-ons store (no admin required)
 2. Open the raw script link in Firefox:
-   `https://raw.githubusercontent.com/youngryan521/Projects/main/fc-auto-v5.user.js`
+
+```
+https://raw.githubusercontent.com/youngryan521/Projects/main/fc-auto-v5.user.js
+```
+
 3. Select all (`Ctrl+A`) -> Copy (`Ctrl+C`)
 4. In Tampermonkey: click the extension icon -> Dashboard -> `+` (New Script)
 5. Select all placeholder text -> paste (`Ctrl+V`) -> `File -> Save`
@@ -801,3 +837,4 @@ ShipApp requires manual configuration before the first order of each shift:
 5. Wait until the screen shows **"Scan the SP00"**
 
 The script only activates once "Scan the SP" text is visible -- so completing setup is required before automation will work.
+
