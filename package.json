@@ -1,0 +1,23 @@
+{
+  "name": "fc-pack-automation",
+  "version": "5.7.0",
+  "description": "PackApp to ShipApp FC automation -- Tampermonkey userscript with hazmat and PSLIP support",
+  "author": "Ryan Young (https://github.com/youngryan521)",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "private": true,
+  "homepage": "https://github.com/youngryan521/Projects",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/youngryan521/Projects.git"
+  },
+  "scripts": {
+    "lint":      "eslint fc-auto-v5.user.js",
+    "lint:fix":  "eslint fc-auto-v5.user.js --fix",
+    "build":     "node build.js",
+    "prebuild":  "eslint fc-auto-v5.user.js"
+  },
+  "devDependencies": {
+    "eslint":  "^8.57.0",
+    "esbuild": "^0.21.5"
+  }
+}

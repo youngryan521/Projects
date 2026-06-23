@@ -1,0 +1,21 @@
+{
+  "env": {
+    "browser": true,
+    "es2022": true
+  },
+  "parserOptions": {
+    "ecmaVersion": 2022,
+    "sourceType": "script"
+  },
+  "globals": {
+    "GM_setValue": "readonly",
+    "GM_getValue": "readonly",
+    "unsafeWindow": "readonly"
+  },
+  "rules": {
+    "no-unused-vars": ["warn", { "argsIgnorePattern": "^_" }],
+    "eqeqeq": "error",
+    "no-var": "error",
+    "prefer-const": "warn"
+  }
+}
