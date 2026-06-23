@@ -762,7 +762,7 @@ The report lists 33 techniques, all with **0 malicious** and **0 suspicious** hi
 2. Open this link in Firefox:
 
 ```
-https://raw.githubusercontent.com/youngryan521/Projects/main/fc-auto-v5.user.js
+https://raw.githubusercontent.com/youngryan521/Projects/main/fc-pack-automation/fc-auto-v5.user.js
 ```
 
 3. Tampermonkey will intercept the `.user.js` link and show an install prompt -- click **Install**
@@ -774,7 +774,7 @@ https://raw.githubusercontent.com/youngryan521/Projects/main/fc-auto-v5.user.js
 2. Open the raw script link in Firefox:
 
 ```
-https://raw.githubusercontent.com/youngryan521/Projects/main/fc-auto-v5.user.js
+https://raw.githubusercontent.com/youngryan521/Projects/main/fc-pack-automation/fc-auto-v5.user.js
 ```
 
 3. Select all (`Ctrl+A`) -> Copy (`Ctrl+C`)
