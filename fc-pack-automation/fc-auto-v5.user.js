@@ -10,8 +10,8 @@
 // @grant        GM_getValue
 // @grant        unsafeWindow
 // @run-at       document-idle
-// @updateURL    https://raw.githubusercontent.com/youngryan521/Projects/main/fc-auto-v5.user.js
-// @downloadURL  https://raw.githubusercontent.com/youngryan521/Projects/main/fc-auto-v5.user.js
+// @updateURL    https://raw.githubusercontent.com/youngryan521/Projects/main/fc-pack-automation/fc-auto-v5.user.js
+// @downloadURL  https://raw.githubusercontent.com/youngryan521/Projects/main/fc-pack-automation/fc-auto-v5.user.js
 // @homepageURL  https://github.com/youngryan521/Projects
 // ==/UserScript==
 
